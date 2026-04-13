@@ -4,6 +4,7 @@ import tempfile
 import shutil
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import FileResponse
+from fastapi.background import BackgroundTasks
 from enum import Enum
 
 app = FastAPI(
@@ -34,6 +35,7 @@ def health():
 
 @app.post("/compress")
 async def compress_pdf(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="PDF file to compress"),
     level: CompressionLevel = Query(
         default=CompressionLevel.ebook,
@@ -61,7 +63,14 @@ async def compress_pdf(
             detail="Ghostscript (gs) is not installed. Cannot compress PDF."
         )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # Use persistent temp files — FileResponse streams AFTER the handler returns,
+    # so a `with TemporaryDirectory()` block would delete files too early.
+    tmpdir = tempfile.mkdtemp()
+
+    def cleanup():
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    try:
         input_path = os.path.join(tmpdir, "input.pdf")
         output_path = os.path.join(tmpdir, "compressed.pdf")
 
@@ -98,20 +107,24 @@ async def compress_pdf(
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
+            cleanup()
             raise HTTPException(
                 status_code=500,
                 detail=f"Ghostscript error: {result.stderr.strip()}"
             )
 
         if not os.path.exists(output_path):
+            cleanup()
             raise HTTPException(status_code=500, detail="Compression produced no output.")
 
         output_size = os.path.getsize(output_path)
         reduction = round((1 - output_size / input_size) * 100, 1) if input_size > 0 else 0
 
-        # Build a descriptive filename
         stem = os.path.splitext(file.filename)[0]
         out_filename = f"{stem}_compressed_{level.value}.pdf"
+
+        # Schedule cleanup AFTER the response has been fully sent
+        background_tasks.add_task(cleanup)
 
         return FileResponse(
             path=output_path,
@@ -122,5 +135,10 @@ async def compress_pdf(
                 "X-Compressed-Size-Bytes": str(output_size),
                 "X-Size-Reduction-Percent": str(reduction),
             },
-            background=None  # keep tmpdir alive until response is sent
         )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        cleanup()
+        raise HTTPException(status_code=500, detail=str(e))
